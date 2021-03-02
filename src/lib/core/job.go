@@ -3,6 +3,8 @@ package core
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"spiderjob/lib/extcron"
 	"spiderjob/lib/ntime"
 	"spiderjob/lib/plugin"
 	"time"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/sirupsen/logrus"
+	"github.com/tidwall/buntdb"
 )
 
 const (
@@ -109,7 +112,7 @@ func (j *Job) ToProto() *proto.Job {
 		HasValue: j.LastSuccess.HasValue(),
 	}
 	if j.LastSuccess.HasValue() {
-		lastSuccess.Time, _ =ptypes.TimestampProto(j.LastSuccess.Get())
+		lastSuccess.Time, _ = ptypes.TimestampProto(j.LastSuccess.Get())
 	}
 	lastError := &proto.Job_NullableTime{
 		HasValue: j.LastError.HasValue(),
@@ -156,7 +159,7 @@ func (j *Job) Run() {
 
 	if j.isRunnable() {
 		log.WithFields(logrus.Fields{
-			"job": j.Name,
+			"job":      j.Name,
 			"schedule": j.Schedule,
 		}).Debug("job: Run job")
 		cronInspect.Set(j.Name, j)
@@ -173,5 +176,171 @@ func (j *Job) String() string {
 }
 
 func (j *Job) GetParent(store *Store) (*Job, error) {
-	
+	if j.Name == j.ParentJob {
+		return nil, ErrSameParent
+	}
+
+	if j.ParentJob == "" {
+		return nil, ErrNoParent
+	}
+
+	parentJob, err := store.GetJob(j.ParentJob, nil)
+	if err != nil {
+		if err == buntdb.ErrNotFound {
+			return nil, ErrParentJobNotFound
+		}
+		return nil, err
+	}
+
+	return parentJob, nil
+}
+
+func (j *Job) GetTimeLocation() *time.Location {
+	loc, _ := time.LoadLocation(j.Timezone)
+	return loc
+}
+
+func (j *Job) GetNext() (time.Time, error) {
+	if j.Schedule != "" {
+		s, err := extcron.Parse(j.Schedule)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return s.Next(time.Now()), nil
+	}
+
+	return time.Time{}, nil
+}
+
+func (j *Job) isRunnable() bool {
+	if j.Disabled {
+		return false
+	}
+
+	if j.Agent.GlobalLock {
+		log.WithField("job", j.Name).Warning("job: Skipping execution because active global lock")
+		return false
+	}
+
+	if j.Concurrency == ConcurrencyForbid {
+		exs, err := j.Agent.GetActiveExecutions()
+		if err != nil {
+			log.WithError(err).Error("job: Error quering for running executions")
+			return false
+		}
+
+		for _, e := range exs {
+			if e.JobName == j.Name {
+				log.WithFields(logrus.Fields{
+					"job":         j.Name,
+					"concurrency": j.Concurrency,
+					"job_status":  j.Status,
+				}).Info("job: Skipping concurrent execution")
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (j *Job) Validate() error {
+	if j.Name == "" {
+		return fmt.Errorf("name can not be empty")
+	}
+
+	if valid, chr := isSlug(j.Name); !valid {
+		return fmt.Errorf("name contains illegal character '%s'", chr)
+	}
+
+	if j.ParentJob == j.Name {
+		return ErrSameParent
+	}
+
+	if j.Schedule != "" || j.ParentJob == "" {
+		if _, err := extcron.Parse(j.Schedule); err != nil {
+			return fmt.Errorf("%s: %s", ErrScheduleParse.Error(), err)
+		}
+	}
+
+	if j.Concurrency != j.ConcurrencyAllow && j.Concurrency != j.ConcurrencyForbid && j.Concurrency != "" {
+		return ErrWrongConcurrency
+	}
+
+	if _, err := time.LoadLocation(j.Timezone); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func isSlug(candidate string) (bool, string) {
+	illegalCharPattern, _ := regexp.Compile(`[\p{Ll}0-9_-]`)
+	whyNot := illegalCharPattern.FindString(candidate)
+	return whyNot == "", whyNot
+}
+
+func generateJobTree(jobs []*Job) ([]*Job, error) {
+	length := len(jobs)
+	j := 0
+	for i := 0; i < length; i++ {
+		rejobs, isTopParentNodeFlag, err := findParentJobAndValidateJob(jobs, j)
+		if err != nil {
+			return nil, err
+		}
+		if isTopParentNodeFlag {
+			j++
+		}
+		jobs = rejobs
+	}
+	return jobs, nil
+}
+
+func findParentJobAndValidateJob(jobs []*Job, index int) ([]*Job, bool, error) {
+	childJob := jobs[index]
+	if err := childJob.Validate(); err != nil {
+		return nil, false, err
+	}
+	if childJob.ParentJob == "" {
+		return jobs, true, nil
+	}
+	for _, parentJob := range jobs {
+		if parentJob.Name == childJob.Name {
+			continue
+		}
+
+		if childJob.ParentJob == parentJob.Name {
+			parentJob.ChildJobs == append(parentJob.ChildJobs, childJob)
+			jobs = append(jobs[:index], jobs[index+1:]...)
+			return jobs, false, nil
+		}
+
+		if len(parentJob.ChildJobs) > 0 {
+			flag := findParentJobInChildJobs(parentJob.ChildJobs, childJob)
+			if flag {
+				jobs = append(jobs[:index], jobs[index+1:]...)
+				return jobs, false, nil
+			}
+		}
+	}
+	return nil, false, ErrNoParent
+}
+
+func findParentJobInChildJobs(jobs []*Job, job *Job) bool {
+	for _, parentJob := range jobs {
+		if job.ParentJob == parentJob.Name {
+			parentJob.ChildJobs == parentJob.Name {
+				parentJob.ChildJobs = append(parentJob.ChildJobs, job)
+				return true
+			}
+		} else {
+			if len(parentJob.ChildJobs) > 0 {
+				flag := findParentJobInChildJobs(parentJob.ChildJobs, job)
+				if flag {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

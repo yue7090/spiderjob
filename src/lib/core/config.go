@@ -1,10 +1,18 @@
 package core
 
 import (
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/hashicorp/go-sockaddr/template"
+	flag "github.com/spf13/pflag"
 )
 
 // Config stores all configuration options for the dkron package.
@@ -191,4 +199,206 @@ func DefaultConfig() *Config {
 		SerfReconnectTimeout: "24h",
 		UI:                   true,
 	}
+}
+
+// ConfigFlagSet creates all of our configuration flags.
+func ConfigFlagSet() *flag.FlagSet {
+	c := DefaultConfig()
+	cmdFlags := flag.NewFlagSet("agent flagset", flag.ContinueOnError)
+
+	cmdFlags.Bool("server", false, "This node is running in server mode")
+	cmdFlags.String("node-name", c.NodeName, "Name of this node. Must be unique in the cluster")
+	cmdFlags.String("bind-addr", c.BindAddr, "Specifies which address the agent should bind to for network services, including the internal gossip protocol and RPC mechanism. This should be specified in IP format, and can be used to easily bind all network services to the same address. The value supports go-sockaddr/template format.")
+	cmdFlags.String("advertise-addr", "", "Address used to advertise to other nodes in the cluster. By default, the bind address is advertised. The value supports go-sockaddr/template format.")
+	cmdFlags.String("http-addr", c.HTTPAddr, "Address to bind the UI web server to. Only used when server. The value supports go-sockaddr/template format.")
+	cmdFlags.String("profile", c.Profile, "Profile is used to control the timing profiles used")
+	cmdFlags.StringSlice("join", []string{}, "An initial agent to join with. This flag can be specified multiple times")
+	cmdFlags.StringSlice("retry-join", []string{}, "Address of an agent to join at start time with retries enabled. Can be specified multiple times.")
+	cmdFlags.Int("retry-max", 0, "Maximum number of join attempts. Defaults to 0, which will retry indefinitely.")
+	cmdFlags.String("retry-interval", DefaultRetryInterval.String(), "Time to wait between join attempts.")
+	cmdFlags.Int("raft-multiplier", c.RaftMultiplier, "An integer multiplier used by servers to scale key Raft timing parameters. Omitting this value or setting it to 0 uses default timing described below. Lower values are used to tighten timing and increase sensitivity while higher values relax timings and reduce sensitivity. Tuning this affects the time it takes to detect leader failures and to perform leader elections, at the expense of requiring more network and CPU resources for better performance. By default, Dkron will use a lower-performance timing that's suitable for minimal Dkron servers, currently equivalent to setting this to a value of 5 (this default may be changed in future versions of Dkron, depending if the target minimum server profile changes). Setting this to a value of 1 will configure Raft to its highest-performance mode is recommended for production Dkron servers. The maximum allowed value is 10.")
+	cmdFlags.StringSlice("tag", []string{}, "Tag can be specified multiple times to attach multiple key/value tag pairs to the given node, specified as key=value")
+	cmdFlags.String("encrypt", "", "Key for encrypting network traffic. Must be a base64-encoded 16-byte key")
+	cmdFlags.String("log-level", c.LogLevel, "Log level (debug|info|warn|error|fatal|panic)")
+	cmdFlags.Int("rpc-port", c.RPCPort, "RPC Port used to communicate with clients. Only used when server. The RPC IP Address will be the same as the bind address")
+	cmdFlags.Int("advertise-rpc-port", 0, "Use the value of rpc-port by default")
+	cmdFlags.Int("bootstrap-expect", 0, "Provides the number of expected servers in the datacenter. Either this value should not be provided or the value must agree with other servers in the cluster. When provided, Dkron waits until the specified number of servers are available and then bootstraps the cluster. This allows an initial leader to be elected automatically. This flag requires server mode.")
+	cmdFlags.String("data-dir", c.DataDir, "Specifies the directory to use for server-specific data, including the replicated log. By default, this is the top-level data-dir, like [/var/lib/dkron]")
+	cmdFlags.String("datacenter", c.Datacenter, "Specifies the data center of the local agent. All members of a datacenter should share a local LAN connection.")
+	cmdFlags.String("region", c.Region, "Specifies the region the Dkron agent is a member of. A region typically maps to a geographic region, for example us, with potentially multiple zones, which map to datacenters such as us-west and us-east")
+	cmdFlags.String("serf-reconnect-timeout", c.SerfReconnectTimeout, "This is the amount of time to attempt to reconnect to a failed node before giving up and considering it completely gone. In Kubernetes, you might need this to about 5s, because there is no reason to try reconnects for default 24h value. Also Raft behaves oddly if node is not reaped and returned with same ID, but different IP. Format there: https://golang.org/pkg/time/#ParseDuration")
+	cmdFlags.Bool("ui", true, "Enable the web UI on this node. The node must be server.")
+
+	// Notifications
+	cmdFlags.String("mail-host", "", "Mail server host address to use for notifications")
+	cmdFlags.Uint16("mail-port", 0, "Mail server port")
+	cmdFlags.String("mail-username", "", "Mail server username used for authentication")
+	cmdFlags.String("mail-password", "", "Mail server password to use")
+	cmdFlags.String("mail-from", "", "From email address to use")
+	cmdFlags.String("mail-payload", "", "Notification mail payload")
+	cmdFlags.String("mail-subject-prefix", c.MailSubjectPrefix, "Notification mail subject prefix")
+	cmdFlags.String("webhook-url", "", "Webhook url to call for notifications")
+	cmdFlags.String("webhook-payload", "", "Body of the POST request to send on webhook call")
+	cmdFlags.StringSlice("webhook-headers", []string{}, "Headers to use when calling the webhook URL. Can be specified multiple times")
+
+	// Observability
+	cmdFlags.String("dog-statsd-addr", "", "DataDog Agent address")
+	cmdFlags.StringSlice("dog-statsd-tags", []string{}, "Datadog tags, specified as key:value")
+	cmdFlags.String("statsd-addr", "", "Statsd address")
+	cmdFlags.Bool("enable-prometheus", false, "Enable serving prometheus metrics")
+
+	return cmdFlags
+}
+
+// normalizeAddrs normalizes Addresses and AdvertiseAddrs to always be
+// initialized and have sane defaults.
+func (c *Config) normalizeAddrs() error {
+	if c.BindAddr != "" {
+		ipStr, err := ParseSingleIPTemplate(c.BindAddr)
+		if err != nil {
+			return fmt.Errorf("bind address resolution failed: %v", err)
+		}
+		c.BindAddr = ipStr
+	}
+
+	if c.HTTPAddr != "" {
+		ipStr, err := ParseSingleIPTemplate(c.HTTPAddr)
+		if err != nil {
+			return fmt.Errorf("bind address resolution failed: %v", err)
+		}
+		c.HTTPAddr = ipStr
+	}
+
+	addr, err := normalizeAdvertise(c.AdvertiseAddr, c.BindAddr, DefaultBindPort, c.DevMode)
+	if err != nil {
+		return fmt.Errorf("failed to parse HTTP advertise address (%v, %v, %v, %v): %v", c.AdvertiseAddr, c.BindAddr, DefaultBindPort, c.DevMode, err)
+	}
+	c.AdvertiseAddr = addr
+
+	return nil
+}
+
+// ParseSingleIPTemplate is used as a helper function to parse out a single IP
+// address from a config parameter.
+func ParseSingleIPTemplate(ipTmpl string) (string, error) {
+	out, err := template.Parse(ipTmpl)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse address template %q: %v", ipTmpl, err)
+	}
+
+	ips := strings.Split(out, " ")
+	switch len(ips) {
+	case 0:
+		return "", errors.New("no addresses found, please configure one")
+	case 1:
+		return ips[0], nil
+	default:
+		return "", fmt.Errorf("multiple addresses found (%q), please configure one", out)
+	}
+}
+
+// normalizeAdvertise returns a normalized advertise address.
+//
+// If addr is set, it is used and the default port is appended if no port is
+// set.
+//
+// If addr is not set and bind is a valid address, the returned string is the
+// bind+port.
+//
+// If addr is not set and bind is not a valid advertise address, the hostname
+// is resolved and returned with the port.
+//
+// Loopback is only considered a valid advertise address in dev mode.
+func normalizeAdvertise(addr string, bind string, defport int, dev bool) (string, error) {
+	addr, err := ParseSingleIPTemplate(addr)
+	if err != nil {
+		return "", fmt.Errorf("Error parsing advertise address template: %v", err)
+	}
+
+	if addr != "" {
+		// Default to using manually configured address
+		_, _, err = net.SplitHostPort(addr)
+		if err != nil {
+			if !isMissingPort(err) && !isTooManyColons(err) {
+				return "", fmt.Errorf("Error parsing advertise address %q: %v", addr, err)
+			}
+
+			// missing port, append the default
+			return net.JoinHostPort(addr, strconv.Itoa(defport)), nil
+		}
+
+		return addr, nil
+	}
+
+	// Fallback to bind address first, and then try resolving the local hostname
+	ips, err := net.LookupIP(bind)
+	if err != nil {
+		return "", fmt.Errorf("Error resolving bind address %q: %v", bind, err)
+	}
+
+	// Return the first non-localhost unicast address
+	for _, ip := range ips {
+		if ip.IsLinkLocalUnicast() || ip.IsGlobalUnicast() {
+			return net.JoinHostPort(ip.String(), strconv.Itoa(defport)), nil
+		}
+		if ip.IsLoopback() {
+			if dev {
+				// loopback is fine for dev mode
+				return net.JoinHostPort(ip.String(), strconv.Itoa(defport)), nil
+			}
+			return "", fmt.Errorf("defaulting advertise to localhost is unsafe, please set advertise manually")
+		}
+	}
+
+	// Bind is not localhost but not a valid advertise IP, use first private IP
+	addr, err = ParseSingleIPTemplate("{{ GetPrivateIP }}")
+	if err != nil {
+		return "", fmt.Errorf("unable to parse default advertise address: %v", err)
+	}
+	return net.JoinHostPort(addr, strconv.Itoa(defport)), nil
+}
+
+// isMissingPort returns true if an error is a "missing port" error from
+// net.SplitHostPort.
+func isMissingPort(err error) bool {
+	// matches error const in net/ipsock.go
+	const missingPort = "missing port in address"
+	return err != nil && strings.Contains(err.Error(), missingPort)
+}
+
+// isTooManyColons returns true if an error is a "too many colons" error from
+// net.SplitHostPort.
+func isTooManyColons(err error) bool {
+	// matches error const in net/ipsock.go
+	const tooManyColons = "too many colons in address"
+	return err != nil && strings.Contains(err.Error(), tooManyColons)
+}
+
+// AddrParts returns the parts of the BindAddr that should be
+// used to configure Serf.
+func (c *Config) AddrParts(address string) (string, int, error) {
+	checkAddr := address
+
+START:
+	_, _, err := net.SplitHostPort(checkAddr)
+	if ae, ok := err.(*net.AddrError); ok && ae.Err == "missing port in address" {
+		checkAddr = fmt.Sprintf("%s:%d", checkAddr, DefaultBindPort)
+		goto START
+	}
+	if err != nil {
+		return "", 0, err
+	}
+
+	// Get the address
+	addr, err := net.ResolveTCPAddr("tcp", checkAddr)
+	if err != nil {
+		return "", 0, err
+	}
+
+	return addr.IP.String(), addr.Port, nil
+}
+
+// EncryptBytes returns the encryption key configured.
+func (c *Config) EncryptBytes() ([]byte, error) {
+	return base64.StdEncoding.DecodeString(c.EncryptKey)
 }
