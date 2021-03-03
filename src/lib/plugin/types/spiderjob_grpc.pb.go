@@ -7,7 +7,7 @@ import (
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
-	protobuf "google/protobuf"
+	// protobuf "google/protobuf"
 )
 
 // This is a compile-time assertion to ensure that this generated file

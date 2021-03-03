@@ -7,6 +7,9 @@ option go_package = "../plugin/types";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
 
+//import "github.com/gogo/protobuf/types/timestamp.proto";
+//import "github.com/gogo/protobuf/types/empty.proto";
+
 message Job {
   string name = 1;
   string timezone = 2;

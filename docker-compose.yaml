@@ -1,15 +1,15 @@
 version: "3.0"
 services:
   go:
-    image: yue7090/go
+    image: golang
     privileged: true
     container_name: spiderjob
     restart: always
     tty: true
     environment:
       - GOPATH=/var/www
-      - GOROOT=/usr/local/go
-      - PATH=$PATH:/usr/bin:/usr/local/bin:/usr/local/go/bin:/var/www/bin
+      # - GOROOT=/usr/local/go
+      # - PATH=$PATH:/usr/bin:/usr/local/bin:/usr/local/go/bin:/var/www/bin
       - GOPROXY=https://goproxy.io
     ports:
       - "9000:9000"
